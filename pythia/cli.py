@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
+import httpx
 import typer
 import uvicorn
 from rich.console import Console
@@ -42,6 +44,25 @@ def _format_idle_time(seconds: float | None) -> str:
     if seconds is None:
         return "never"
     return f"{int(max(0, seconds))}s"
+
+
+def _print_pull_status(payload: dict[str, object]) -> None:
+    status = str(payload.get("status", ""))
+    model_name = payload.get("model")
+    error = payload.get("error")
+
+    if status == "error":
+        if isinstance(error, str) and error:
+            console.print(f"[red]error[/red]: {error}")
+        else:
+            console.print("[red]error[/red]")
+        return
+
+    if model_name:
+        console.print(f"{status}: {model_name}")
+        return
+
+    console.print(status)
 
 
 @app.command()
@@ -131,3 +152,58 @@ def stop() -> None:
         console.print("Stopped Pythia API server.")
     else:
         console.print("No running Pythia API server found.")
+
+
+@app.command()
+def pull(
+    model_name: str = typer.Argument(..., metavar="MODEL_NAME"),
+    config: Path = typer.Option(
+        Path("config.yaml"),
+        "--config",
+        "-c",
+        exists=False,
+        dir_okay=False,
+        help="Path to config.yaml",
+    ),
+    api_port: int = typer.Option(
+        11434,
+        "--api-port",
+        help="Port for the integrated Pythia API server",
+    ),
+) -> None:
+    """Pull a model through the running Pythia API server."""
+    _ = config
+    url = f"http://127.0.0.1:{api_port}/api/pull"
+
+    try:
+        with httpx.stream("POST", url, json={"model": model_name}, timeout=None) as response:
+            if response.status_code == 404:
+                try:
+                    error_detail = response.json().get("detail", "")
+                except (json.JSONDecodeError, ValueError, AttributeError):
+                    error_detail = response.text
+                fallback_error = f"Unknown model '{model_name}'"
+                console.print(f"[red]Error:[/red] {error_detail or fallback_error}")
+                raise typer.Exit(code=1)
+
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                payload = json.loads(line)
+                _print_pull_status(payload)
+                if payload.get("status") == "success":
+                    console.print(f"Pulled {model_name} successfully.")
+                    return
+                if payload.get("status") == "error":
+                    raise typer.Exit(code=1)
+
+            console.print("[red]Error:[/red] Pull did not complete successfully.")
+            raise typer.Exit(code=1)
+    except httpx.RequestError as error:
+        console.print("Pythia API server is not running. Start it with 'pythia serve'.")
+        raise typer.Exit(code=1) from error
+    except httpx.HTTPStatusError as error:
+        console.print(f"[red]Error:[/red] {error.response.text or 'Request failed.'}")
+        raise typer.Exit(code=1) from error

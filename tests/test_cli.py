@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import httpx
 from typer.testing import CliRunner
 
 from pythia import cli
@@ -49,6 +50,41 @@ class FakeUvicornServer:
     def run(self) -> None:
         payload = json.loads(api_pid_path().read_text(encoding="utf-8"))
         self._observed.append((payload["pid"], payload["port"]))
+
+
+class FakeStreamResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        lines: list[str] | None = None,
+        json_data: dict[str, object] | None = None,
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self._lines = lines or []
+        self._json_data = json_data
+        self.text = text
+
+    def __enter__(self) -> FakeStreamResponse:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    def iter_lines(self) -> list[str]:
+        return self._lines
+
+    def json(self) -> dict[str, object]:
+        if self._json_data is None:
+            raise json.JSONDecodeError("invalid", "", 0)
+        return self._json_data
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            request = httpx.Request("POST", "http://127.0.0.1:11434/api/pull")
+            response = httpx.Response(self.status_code, request=request, text=self.text)
+            raise httpx.HTTPStatusError("request failed", request=request, response=response)
 
 
 class CliTests(unittest.TestCase):
@@ -114,6 +150,52 @@ class CliTests(unittest.TestCase):
         self.assertIn("stopped", result.stdout)
         self.assertIn("No model currently loaded.", result.stdout)
         self.assertNotIn("No tracked processes found in ~/.pythia/pids/", result.stdout)
+
+    def test_pull_streams_success(self) -> None:
+        response = FakeStreamResponse(
+            lines=[
+                json.dumps({"status": "pulling manifest", "model": "alpha"}),
+                json.dumps({"status": "downloading", "model": "alpha"}),
+                json.dumps({"status": "success", "model": "alpha", "completed": 10, "total": 10}),
+            ]
+        )
+
+        with mock.patch("pythia.cli.httpx.stream", return_value=response) as stream:
+            result = self.runner.invoke(cli.app, ["pull", "alpha"])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("pulling manifest: alpha", result.stdout)
+        self.assertIn("downloading: alpha", result.stdout)
+        self.assertIn("success: alpha", result.stdout)
+        self.assertIn("Pulled alpha successfully.", result.stdout)
+        stream.assert_called_once_with(
+            "POST",
+            "http://127.0.0.1:11434/api/pull",
+            json={"model": "alpha"},
+            timeout=None,
+        )
+
+    def test_pull_unknown_model_returns_404(self) -> None:
+        response = FakeStreamResponse(
+            status_code=404,
+            json_data={"detail": "Unknown model 'missing'"},
+        )
+
+        with mock.patch("pythia.cli.httpx.stream", return_value=response):
+            result = self.runner.invoke(cli.app, ["pull", "missing"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Unknown model 'missing'", result.stdout)
+
+    def test_pull_shows_server_not_running_when_unreachable(self) -> None:
+        request = httpx.Request("POST", "http://127.0.0.1:11434/api/pull")
+        error = httpx.ConnectError("Connection refused", request=request)
+
+        with mock.patch("pythia.cli.httpx.stream", side_effect=error):
+            result = self.runner.invoke(cli.app, ["pull", "alpha"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Pythia API server is not running. Start it with 'pythia serve'.", result.stdout)
 
 
 if __name__ == "__main__":
