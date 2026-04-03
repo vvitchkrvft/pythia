@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -95,12 +96,25 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
     def ollama_line(payload: dict[str, Any]) -> bytes:
         return (json.dumps(payload) + "\n").encode("utf-8")
 
+    def sse_line(payload: dict[str, Any] | str) -> bytes:
+        data = payload if isinstance(payload, str) else json.dumps(payload)
+        return f"data: {data}\n\n".encode("utf-8")
+
     def chat_prompt(tokenizer: object, messages: list[dict[str, Any]]) -> str:
         return tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
+
+    def openai_chat_id() -> str:
+        return f"chatcmpl-{uuid4().hex}"
+
+    def openai_created() -> int:
+        return int(datetime.now(tz=UTC).timestamp())
+
+    def openai_model_row(model_name: str) -> dict[str, str]:
+        return {"id": model_name, "object": "model", "owned_by": "pythia"}
 
     def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         options = payload.get("options", {})
@@ -136,6 +150,17 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             if chunk is None:
                 break
             yield chunk
+
+    async def chat_response_text(model_name: str, messages: list[dict[str, Any]], kwargs: dict[str, Any]) -> str:
+        async with runtime.session(model_name) as session:
+            prompt = chat_prompt(session.tokenizer, messages)
+            return await run_generate(session.model, session.tokenizer, prompt, kwargs)
+
+    async def chat_chunks(model_name: str, messages: list[dict[str, Any]], kwargs: dict[str, Any]):
+        async with runtime.session(model_name) as session:
+            prompt = chat_prompt(session.tokenizer, messages)
+            async for chunk in iter_generate(session.model, session.tokenizer, prompt, kwargs):
+                yield chunk
 
     @app.get("/api/tags")
     async def api_tags() -> dict[str, list[dict[str, Any]]]:
@@ -258,23 +283,19 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
                             "status": "loading model",
                         }
                     )
-                async with runtime.session(model_name) as session:
-                    prompt = chat_prompt(session.tokenizer, messages)
-                    async for chunk in iter_generate(session.model, session.tokenizer, prompt, kwargs):
-                        yield ollama_line(
-                            {
-                                "model": model_name,
-                                "created_at": now_iso(),
-                                "message": {"role": "assistant", "content": chunk.text},
-                                "done": chunk.finish_reason is not None,
-                            }
-                        )
+                async for chunk in chat_chunks(model_name, messages, kwargs):
+                    yield ollama_line(
+                        {
+                            "model": model_name,
+                            "created_at": now_iso(),
+                            "message": {"role": "assistant", "content": chunk.text},
+                            "done": chunk.finish_reason is not None,
+                        }
+                    )
 
             return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
-        async with runtime.session(model_name) as session:
-            prompt = chat_prompt(session.tokenizer, messages)
-            response_text = await run_generate(session.model, session.tokenizer, prompt, kwargs)
+        response_text = await chat_response_text(model_name, messages, kwargs)
         return JSONResponse(
             {
                 "model": model_name,
@@ -311,5 +332,77 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             "modified_at": modified_at,
             "details": {"model_id": model_config.model_id},
         }
+
+    @app.get("/v1/models")
+    async def openai_models() -> dict[str, Any]:
+        return {"object": "list", "data": [openai_model_row(model.name) for model in registry.all()]}
+
+    @app.get("/v1/models/{model_ref:path}")
+    async def openai_model(model_ref: str) -> dict[str, str]:
+        model = get_model(model_ref)
+        return openai_model_row(model.name)
+
+    async def openai_chat(payload: dict[str, Any]) -> Any:
+        model_name = payload.get("model")
+        messages = payload.get("messages")
+        if not isinstance(model_name, str) or not isinstance(messages, list):
+            raise HTTPException(status_code=400, detail="Expected 'model' and 'messages'")
+
+        model = get_model(model_name)
+        stream = bool(payload.get("stream", False))
+        kwargs = generation_kwargs(payload)
+        completion_id = openai_chat_id()
+        created = openai_created()
+
+        if stream:
+            async def event_stream():
+                async for chunk in chat_chunks(model.name, messages, kwargs):
+                    finish_reason = chunk.finish_reason
+                    delta: dict[str, Any] = {}
+                    if chunk.text:
+                        delta["content"] = chunk.text
+                    yield sse_line(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model.name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": delta,
+                                    "finish_reason": finish_reason,
+                                }
+                            ],
+                        }
+                    )
+                yield sse_line("[DONE]")
+
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+        response_text = await chat_response_text(model.name, messages, kwargs)
+        return JSONResponse(
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model.name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": response_text},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+
+    @app.post("/v1/chat/completions")
+    async def openai_chat_v1(payload: dict[str, Any]) -> Any:
+        return await openai_chat(payload)
+
+    @app.post("/chat/completions")
+    async def openai_chat_unversioned(payload: dict[str, Any]) -> Any:
+        return await openai_chat(payload)
 
     return app

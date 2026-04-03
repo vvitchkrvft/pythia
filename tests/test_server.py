@@ -16,13 +16,19 @@ from pythia.server import create_app
 
 class FakeRegistry:
     def __init__(self, _config_path: Path) -> None:
-        self._models = [ModelConfig(name="alpha", model_id="repo/alpha")]
+        self._models = [
+            ModelConfig(name="alpha", model_id="repo/alpha"),
+            ModelConfig(name="qwen3-coder", model_id="mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"),
+        ]
 
     def all(self) -> list[ModelConfig]:
         return list(self._models)
 
     def get(self, name: str) -> ModelConfig | None:
-        return next((model for model in self._models if model.name == name), None)
+        for model in self._models:
+            if model.name == name:
+                return model
+        return next((model for model in self._models if model.model_id == name), None)
 
 
 class FakeTokenizer:
@@ -137,6 +143,85 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["models"][0]["status"], "loaded")
+
+    def test_v1_models_returns_openai_model_list(self) -> None:
+        client = self.create_client()
+        response = client.get("/v1/models")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["object"], "list")
+        self.assertEqual(response.json()["data"][0]["object"], "model")
+        self.assertEqual(response.json()["data"][0]["owned_by"], "pythia")
+
+    def test_v1_model_lookup_supports_model_id(self) -> None:
+        client = self.create_client()
+        response = client.get("/v1/models/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], "qwen3-coder")
+        self.assertEqual(response.json()["object"], "model")
+
+    def test_v1_chat_completions_returns_non_streaming_openai_response(self) -> None:
+        with mock.patch("pythia.server.generate", return_value="Hello!"):
+            client = self.create_client()
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3-coder",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+            )
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["object"], "chat.completion")
+        self.assertEqual(payload["model"], "qwen3-coder")
+        self.assertEqual(payload["choices"][0]["message"]["content"], "Hello!")
+        self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
+
+    def test_v1_chat_completions_streams_sse_chunks(self) -> None:
+        chunks = [
+            mock.Mock(text="Hello", finish_reason=None),
+            mock.Mock(text="!", finish_reason="stop"),
+        ]
+
+        with mock.patch("pythia.server.stream_generate", return_value=iter(chunks)):
+            client = self.create_client()
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "qwen3-coder",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"].split(";")[0], "text/event-stream")
+        events = [event for event in response.text.strip().split("\n\n") if event]
+        first = json.loads(events[0].removeprefix("data: "))
+        second = json.loads(events[1].removeprefix("data: "))
+        self.assertEqual(first["object"], "chat.completion.chunk")
+        self.assertEqual(first["choices"][0]["delta"]["content"], "Hello")
+        self.assertIsNone(first["choices"][0]["finish_reason"])
+        self.assertEqual(second["choices"][0]["delta"]["content"], "!")
+        self.assertEqual(second["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(events[2], "data: [DONE]")
+
+    def test_chat_completions_without_v1_uses_openai_format(self) -> None:
+        with mock.patch("pythia.server.generate", return_value="Hello!"):
+            client = self.create_client()
+            response = client.post(
+                "/chat/completions",
+                json={
+                    "model": "qwen3-coder",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["object"], "chat.completion")
 
 
 if __name__ == "__main__":
