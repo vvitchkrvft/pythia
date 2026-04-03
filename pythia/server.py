@@ -125,6 +125,8 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
                 max_tokens = options.get("num_predict")
             if temperature is None:
                 temperature = options.get("temperature")
+        if max_tokens is None:
+            max_tokens = 4096
 
         kwargs: dict[str, Any] = {}
         if isinstance(max_tokens, int):

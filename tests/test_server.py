@@ -104,6 +104,17 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["response"], "hello world")
 
+    def test_generate_defaults_max_tokens_to_4096(self) -> None:
+        with mock.patch("pythia.server.generate", return_value="hello world") as generate:
+            client = self.create_client()
+            response = client.post(
+                "/api/generate",
+                json={"model": "alpha", "prompt": "hi", "stream": False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(generate.call_args.kwargs["max_tokens"], 4096)
+
     def test_chat_stream_emits_loading_line_then_tokens(self) -> None:
         chunks = [
             mock.Mock(text="hello", finish_reason=None),
