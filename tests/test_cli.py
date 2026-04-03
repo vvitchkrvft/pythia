@@ -110,7 +110,10 @@ class CliTests(unittest.TestCase):
     def test_ps_shows_no_model_when_api_stopped(self) -> None:
         result = self.runner.invoke(cli.app, ["ps"])
         self.assertEqual(result.exit_code, 0)
+        self.assertIn("API Server", result.stdout)
+        self.assertIn("stopped", result.stdout)
         self.assertIn("No model currently loaded.", result.stdout)
+        self.assertNotIn("No tracked processes found in ~/.pythia/pids/", result.stdout)
 
 
 if __name__ == "__main__":

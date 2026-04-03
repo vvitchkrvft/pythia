@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from pythia.registry import ModelRegistry
 from pythia.runtime import RuntimeManager
+from pythia.state import read_loaded_model_state
 
 
 class PullRequest(BaseModel):
@@ -111,7 +112,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             if temperature is None:
                 temperature = options.get("temperature")
 
-        kwargs: dict[str, Any] = {"verbose": False}
+        kwargs: dict[str, Any] = {}
         if isinstance(max_tokens, int):
             kwargs["max_tokens"] = max_tokens
         if isinstance(temperature, int | float):
@@ -138,7 +139,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
 
     @app.get("/api/tags")
     async def api_tags() -> dict[str, list[dict[str, Any]]]:
-        current_model = runtime.current_model()
+        current_model = runtime.current_model() or read_loaded_model_state()
         model_rows: list[dict[str, Any]] = []
         for model in registry.all():
             size, modified_at = get_model_stats(model.model_id)

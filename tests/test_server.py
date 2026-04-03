@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -63,6 +65,19 @@ class FakeRuntimeManager:
 
 
 class ServerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.previous_pythia_home = os.environ.get("PYTHIA_HOME")
+        os.environ["PYTHIA_HOME"] = self.temp_dir.name
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self) -> None:
+        if self.previous_pythia_home is None:
+            os.environ.pop("PYTHIA_HOME", None)
+        else:
+            os.environ["PYTHIA_HOME"] = self.previous_pythia_home
+
     def create_client(self):
         with (
             mock.patch("pythia.server.ModelRegistry", FakeRegistry),
@@ -105,6 +120,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(lines[0]["status"], "loading model")
         self.assertEqual(lines[1]["message"]["content"], "hello")
         self.assertTrue(lines[2]["done"])
+
+    def test_tags_returns_available_when_no_model_loaded(self) -> None:
+        client = self.create_client()
+        response = client.get("/api/tags")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["models"][0]["status"], "available")
+
+    def test_tags_returns_loaded_for_current_model_from_runtime_state(self) -> None:
+        with mock.patch("pythia.server.read_loaded_model_state") as read_state:
+            read_state.return_value = mock.Mock()
+            read_state.return_value.name = "alpha"
+            client = self.create_client()
+            response = client.get("/api/tags")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["models"][0]["status"], "loaded")
 
 
 if __name__ == "__main__":

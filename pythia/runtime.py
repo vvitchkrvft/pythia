@@ -34,7 +34,7 @@ class RuntimeManager:
         keep_alive_seconds: int | None = None,
         load_model: Callable[..., tuple[object, object]] = load,
         process_factory: Callable[..., psutil.Process] = psutil.Process,
-        clear_cache: Callable[[], None] = mx.metal.clear_cache,
+        clear_cache: Callable[[], None] = mx.clear_cache,
     ) -> None:
         self._registry = registry
         self._keep_alive_seconds = self._parse_keep_alive(keep_alive_seconds)
