@@ -1,6 +1,4 @@
-def main():
-    print("Hello from pythia!")
-
+from pythia.cli import app
 
 if __name__ == "__main__":
-    main()
+    app()
