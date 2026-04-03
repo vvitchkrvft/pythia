@@ -2,27 +2,25 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Annotated
 
 import typer
 import uvicorn
 from rich.console import Console
 from rich.table import Table
 
-from pythia.config import load_config
-from pythia.process import (
+from pythia.registry import ModelRegistry
+from pythia.server import create_app
+from pythia.state import (
     delete_api_pid,
-    get_api_server_status,
-    list_process_statuses,
-    load_record,
+    delete_loaded_model_state,
+    read_api_server_status,
+    read_loaded_model_state,
+    remaining_idle_seconds,
     stop_api_server,
-    stop_all_models,
-    stop_model,
     write_api_pid,
 )
-from pythia.server import create_app
 
-app = typer.Typer(help="Pythia API server and model process manager.")
+app = typer.Typer(help="Pythia API server and in-process model manager.")
 console = Console()
 
 
@@ -38,6 +36,12 @@ def _format_ram(ram_bytes: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{ram_bytes} B"
+
+
+def _format_idle_time(seconds: float | None) -> str:
+    if seconds is None:
+        return "never"
+    return f"{int(max(0, seconds))}s"
 
 
 @app.command()
@@ -58,7 +62,7 @@ def serve(
 ) -> None:
     """Start the integrated Pythia API server."""
     try:
-        load_config(config)
+        ModelRegistry(config)
         write_api_pid(os.getpid(), host="127.0.0.1", port=api_port)
         console.print(f"Starting API server on 127.0.0.1:{api_port}")
         server = uvicorn.Server(
@@ -77,16 +81,13 @@ def serve(
         console.print("\nShutting down Pythia...")
     finally:
         delete_api_pid()
-        stop_results = stop_all_models(warn=_warn)
-        for result in stop_results:
-            if result.was_running:
-                console.print(f"Stopped {result.record.name} (PID {result.record.pid})")
+        delete_loaded_model_state()
 
 
 @app.command("ps")
 def ps_command() -> None:
-    """Show API server and model process status."""
-    api_status = get_api_server_status(warn=_warn)
+    """Show API server status and the currently loaded model."""
+    api_status = read_api_server_status(warn=_warn)
     api_table = Table(title="API Server")
     api_table.add_column("Status")
     api_table.add_column("PID", justify="right")
@@ -101,72 +102,32 @@ def ps_command() -> None:
     )
     console.print(api_table)
 
-    statuses = list_process_statuses(warn=_warn)
-    if not statuses:
-        console.print("No tracked model processes found in ~/.pythia/pids/")
+    if api_status.status != "running":
+        delete_loaded_model_state()
+
+    loaded_model = read_loaded_model_state(warn=_warn) if api_status.status == "running" else None
+    if loaded_model is None:
+        console.print("No model currently loaded.")
         return
 
-    table = Table(title="Model Processes")
-    table.add_column("Model Name")
-    table.add_column("Port", justify="right")
-    table.add_column("PID", justify="right")
-    table.add_column("Status")
-    table.add_column("RAM", justify="right")
-
-    for status in statuses:
-        status_style = "green" if status.status == "running" else "red"
-        table.add_row(
-            status.name,
-            str(status.port),
-            str(status.pid),
-            f"[{status_style}]{status.status}[/{status_style}]",
-            _format_ram(status.ram_bytes),
-        )
-
+    table = Table(title="Loaded Model")
+    table.add_column("Name")
+    table.add_column("Model ID")
+    table.add_column("Memory", justify="right")
+    table.add_column("Idle Unload", justify="right")
+    table.add_row(
+        loaded_model.name,
+        loaded_model.model_id,
+        _format_ram(loaded_model.memory_bytes),
+        _format_idle_time(remaining_idle_seconds(loaded_model)),
+    )
     console.print(table)
 
 
 @app.command()
-def stop(
-    model_name: Annotated[
-        str | None, typer.Argument(help="Model name to stop. Omit to stop the API server.")
-    ] = None,
-    all: bool = typer.Option(False, "--all", help="Stop the API server and all tracked models"),
-) -> None:
-    """Stop the API server, or stop one model by name."""
-    if all:
-        api_stopped = stop_api_server(warn=_warn)
-        stop_results = stop_all_models(warn=_warn)
-        if api_stopped:
-            console.print("Stopped Pythia API server.")
-
-        for result in stop_results:
-            if result.was_running:
-                console.print(f"Stopped {result.record.name} (PID {result.record.pid})")
-            else:
-                console.print(f"{result.record.name} was already stopped.")
-        if not api_stopped and not stop_results:
-            console.print("No running Pythia API server or tracked models found.")
-        return
-
-    if model_name is None:
-        if stop_api_server(warn=_warn):
-            console.print("Stopped Pythia API server.")
-        else:
-            console.print("No running Pythia API server found.")
-        return
-
-    record = load_record(model_name, warn=_warn)
-    if record is None:
-        console.print(f"No tracked model named '{model_name}' found.")
-        return
-
-    stop_result = stop_model(model_name, warn=_warn)
-    if stop_result is None:
-        console.print(f"No tracked model named '{model_name}' found.")
-        return
-
-    if stop_result.was_running:
-        console.print(f"Stopped {stop_result.record.name} (PID {stop_result.record.pid})")
+def stop() -> None:
+    """Stop the Pythia API server."""
+    if stop_api_server(warn=_warn):
+        console.print("Stopped Pythia API server.")
     else:
-        console.print(f"{stop_result.record.name} is already stopped.")
+        console.print("No running Pythia API server found.")

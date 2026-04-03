@@ -1,195 +1,191 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import os
+import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Callable
 
-import httpx
+import mlx.core as mx
+import psutil
+from mlx_lm import load
 
 from pythia.config import ModelConfig
-from pythia.process import ProcessRecord, get_live_record, start_model_server, stop_model
-
-RuntimeState = Literal["stopped", "starting", "ready", "failed"]
-
-CHAT_PROBE_PAYLOAD = {
-    "model": "default_model",
-    "messages": [{"role": "user", "content": "ping"}],
-    "stream": False,
-    "max_tokens": 1,
-    "temperature": 0,
-}
+from pythia.registry import ModelRegistry
+from pythia.state import LoadedModelState, delete_loaded_model_state, write_loaded_model_state
 
 
 @dataclass(slots=True)
-class RuntimeStatus:
-    name: str
+class LoadedModelSession:
+    alias: str
     model_id: str
-    port: int
-    state: RuntimeState
-    pid: int | None
-    last_error: str | None
-
-
-@dataclass(slots=True)
-class RuntimeEntry:
-    model: ModelConfig
-    state: RuntimeState = "stopped"
-    pid: int | None = None
-    last_error: str | None = None
-    startup_task: asyncio.Task[None] | None = None
-    lock: asyncio.Lock | None = None
-
-    def __post_init__(self) -> None:
-        self.lock = asyncio.Lock()
+    model: object
+    tokenizer: object
+    loaded_now: bool
 
 
 class RuntimeManager:
     def __init__(
         self,
-        models: list[ModelConfig],
+        registry: ModelRegistry,
         *,
-        startup_timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.25,
-        http_timeout_seconds: float = 5.0,
-        start_server: Callable[..., ProcessRecord] = start_model_server,
-        stop_server: Callable[..., object | None] = stop_model,
-        live_record_loader: Callable[..., ProcessRecord | None] = get_live_record,
-        async_client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
+        keep_alive_seconds: int | None = None,
+        load_model: Callable[..., tuple[object, object]] = load,
+        process_factory: Callable[..., psutil.Process] = psutil.Process,
+        clear_cache: Callable[[], None] = mx.metal.clear_cache,
     ) -> None:
-        self._entries = {
-            model.name: RuntimeEntry(model=model)
-            for model in models
-        }
-        self._startup_timeout_seconds = startup_timeout_seconds
-        self._poll_interval_seconds = poll_interval_seconds
-        self._http_timeout_seconds = http_timeout_seconds
-        self._start_server = start_server
-        self._stop_server = stop_server
-        self._live_record_loader = live_record_loader
-        self._async_client_factory = async_client_factory
+        self._registry = registry
+        self._keep_alive_seconds = self._parse_keep_alive(keep_alive_seconds)
+        self._load_model = load_model
+        self._process_factory = process_factory
+        self._clear_cache = clear_cache
+        self._slot_lock = asyncio.Lock()
+        self._inference_lock = asyncio.Lock()
+        self._idle_task: asyncio.Task[None] | None = None
+        self._loaded_config: ModelConfig | None = None
+        self._model: object | None = None
+        self._tokenizer: object | None = None
+        self._loaded_at: float | None = None
+        self._idle_expires_at: float | None = None
 
-    def get_model(self, alias: str) -> ModelConfig:
-        entry = self._entries.get(alias)
-        if entry is None:
-            raise KeyError(alias)
-        return entry.model
+    @staticmethod
+    def _parse_keep_alive(explicit_keep_alive: int | None) -> int:
+        if explicit_keep_alive is not None:
+            return max(0, explicit_keep_alive)
+        raw_value = os.environ.get("PYTHIA_KEEP_ALIVE", "300")
+        try:
+            return max(0, int(raw_value))
+        except ValueError as error:
+            raise ValueError("PYTHIA_KEEP_ALIVE must be an integer number of seconds") from error
 
-    def get_status(self, alias: str) -> RuntimeStatus:
-        entry = self._require_entry(alias)
-        live_record = self._live_record_loader(alias)
-        if live_record is None and entry.state == "ready":
-            entry.state = "stopped"
-            entry.pid = None
-        elif live_record is not None:
-            entry.pid = live_record.pid
+    def needs_load(self, alias: str) -> bool:
+        return self._loaded_config is None or self._loaded_config.name != alias
 
-        return RuntimeStatus(
-            name=entry.model.name,
-            model_id=entry.model.model_id,
-            port=entry.model.port,
-            state=entry.state,
-            pid=entry.pid,
-            last_error=entry.last_error,
+    def current_model(self) -> LoadedModelState | None:
+        if self._loaded_config is None:
+            return None
+        return LoadedModelState(
+            name=self._loaded_config.name,
+            model_id=self._loaded_config.model_id,
+            memory_bytes=self._current_memory_bytes(),
+            idle_expires_at=self._idle_expires_at,
         )
 
-    def list_statuses(self) -> list[RuntimeStatus]:
-        return [self.get_status(alias) for alias in sorted(self._entries)]
-
-    async def ensure_ready(self, alias: str) -> None:
-        entry = self._require_entry(alias)
-        task: asyncio.Task[None] | None = None
-
-        async with entry.lock:
-            live_record = await asyncio.to_thread(self._live_record_loader, alias)
-            if live_record is not None:
-                entry.pid = live_record.pid
-                if entry.state == "ready":
-                    return
-
-            if entry.startup_task is None:
-                entry.state = "starting"
-                entry.last_error = None
-                entry.startup_task = asyncio.create_task(self._start_or_probe(entry))
-            task = entry.startup_task
-
-        assert task is not None
-        await task
-
-    def _require_entry(self, alias: str) -> RuntimeEntry:
-        entry = self._entries.get(alias)
-        if entry is None:
+    async def ensure_ready(self, alias: str) -> LoadedModelSession:
+        config = self._registry.get(alias)
+        if config is None:
             raise KeyError(alias)
-        return entry
 
-    async def _start_or_probe(self, entry: RuntimeEntry) -> None:
-        started_here = False
+        async with self._slot_lock:
+            self._cancel_idle_unload_locked()
+            loaded_now = False
+            if self._loaded_config is None or self._loaded_config.name != alias:
+                await self._unload_locked()
+                model, tokenizer = await asyncio.to_thread(
+                    self._load_model,
+                    config.model_id,
+                )
+                self._loaded_config = config
+                self._model = model
+                self._tokenizer = tokenizer
+                self._loaded_at = time.time()
+                loaded_now = True
+
+            self._refresh_idle_deadline_locked()
+            self._write_runtime_state_locked()
+
+            assert self._model is not None
+            assert self._tokenizer is not None
+            return LoadedModelSession(
+                alias=config.name,
+                model_id=config.model_id,
+                model=self._model,
+                tokenizer=self._tokenizer,
+                loaded_now=loaded_now,
+            )
+
+    @asynccontextmanager
+    async def session(self, alias: str):
+        async with self._inference_lock:
+            session = await self.ensure_ready(alias)
+            try:
+                yield session
+            finally:
+                async with self._slot_lock:
+                    self._refresh_idle_deadline_locked()
+                    self._write_runtime_state_locked()
+                    self._schedule_idle_unload_locked()
+
+    async def unload(self, alias: str | None = None) -> bool:
+        async with self._slot_lock:
+            if self._loaded_config is None:
+                return False
+            if alias is not None and self._loaded_config.name != alias:
+                return False
+            await self._unload_locked()
+            return True
+
+    async def shutdown(self) -> None:
+        async with self._slot_lock:
+            self._cancel_idle_unload_locked()
+            await self._unload_locked()
+
+    async def _unload_locked(self) -> None:
+        self._cancel_idle_unload_locked()
+        self._loaded_config = None
+        self._model = None
+        self._tokenizer = None
+        self._loaded_at = None
+        self._idle_expires_at = None
+        gc.collect()
+        self._clear_cache()
+        delete_loaded_model_state()
+
+    def _current_memory_bytes(self) -> int:
         try:
-            live_record = await asyncio.to_thread(self._live_record_loader, entry.model.name)
-            if live_record is None:
-                live_record = await asyncio.to_thread(self._start_server, entry.model)
-                started_here = True
+            return self._process_factory().memory_info().rss
+        except psutil.Error:
+            return 0
 
-            entry.pid = live_record.pid
-            await self._wait_until_ready(entry)
-            entry.state = "ready"
-            entry.last_error = None
-        except Exception as error:
-            entry.state = "failed"
-            entry.last_error = str(error)
-            if started_here:
-                await asyncio.to_thread(self._stop_server, entry.model.name)
-            entry.pid = None
-            raise
-        finally:
-            async with entry.lock:
-                entry.startup_task = None
+    def _refresh_idle_deadline_locked(self) -> None:
+        if self._keep_alive_seconds == 0:
+            self._idle_expires_at = None
+        else:
+            self._idle_expires_at = time.time() + self._keep_alive_seconds
 
-    async def _wait_until_ready(self, entry: RuntimeEntry) -> None:
-        deadline = asyncio.get_running_loop().time() + self._startup_timeout_seconds
-        base_url = f"http://127.0.0.1:{entry.model.port}"
+    def _write_runtime_state_locked(self) -> None:
+        if self._loaded_config is None:
+            delete_loaded_model_state()
+            return
+        write_loaded_model_state(
+            LoadedModelState(
+                name=self._loaded_config.name,
+                model_id=self._loaded_config.model_id,
+                memory_bytes=self._current_memory_bytes(),
+                idle_expires_at=self._idle_expires_at,
+            )
+        )
 
-        while True:
-            live_record = await asyncio.to_thread(self._live_record_loader, entry.model.name)
-            if live_record is None:
-                raise RuntimeError(
-                    f"Model '{entry.model.name}' exited before becoming ready"
-                )
+    def _schedule_idle_unload_locked(self) -> None:
+        self._cancel_idle_unload_locked()
+        if self._loaded_config is None or self._keep_alive_seconds == 0:
+            return
+        self._idle_task = asyncio.create_task(self._idle_unload_after(self._keep_alive_seconds))
 
-            entry.pid = live_record.pid
-            if await self._probe_ready(base_url):
-                return
+    def _cancel_idle_unload_locked(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
 
-            if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for model '{entry.model.name}' to become ready"
-                )
-
-            await asyncio.sleep(self._poll_interval_seconds)
-
-    async def _probe_ready(self, base_url: str) -> bool:
+    async def _idle_unload_after(self, delay_seconds: int) -> None:
         try:
-            async with self._async_client_factory(timeout=self._http_timeout_seconds) as client:
-                health_response = await client.get(f"{base_url}/health")
-                if health_response.status_code != 200:
-                    return False
-
-                probe_response = await client.post(
-                    f"{base_url}/v1/chat/completions",
-                    json=CHAT_PROBE_PAYLOAD,
-                )
-                probe_response.raise_for_status()
-                return self._is_valid_chat_completion(probe_response.json())
-        except (httpx.HTTPError, ValueError):
-            return False
-
-    def _is_valid_chat_completion(self, payload: object) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
-            return False
-        first_choice = choices[0]
-        if not isinstance(first_choice, dict):
-            return False
-        message = first_choice.get("message")
-        return isinstance(message, dict)
+            await asyncio.sleep(delay_seconds)
+            async with self._slot_lock:
+                if self._inference_lock.locked():
+                    self._schedule_idle_unload_locked()
+                    return
+                await self._unload_locked()
+        except asyncio.CancelledError:
+            return

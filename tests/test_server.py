@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -10,42 +12,99 @@ from pythia.config import ModelConfig
 from pythia.server import create_app
 
 
-class StubRuntimeManager:
-    def __init__(self, models: list[ModelConfig]) -> None:
-        self._models = models
+class FakeRegistry:
+    def __init__(self, _config_path: Path) -> None:
+        self._models = [ModelConfig(name="alpha", model_id="repo/alpha")]
 
-    async def ensure_ready(self, alias: str) -> None:
-        return None
+    def all(self) -> list[ModelConfig]:
+        return list(self._models)
 
-    def list_statuses(self) -> list[object]:
-        return []
+    def get(self, name: str) -> ModelConfig | None:
+        return next((model for model in self._models if model.name == name), None)
 
 
-class ServerConfigCachingTests(unittest.TestCase):
-    def test_create_app_loads_config_once_not_per_request(self) -> None:
-        load_calls = 0
-        models = [ModelConfig(name="alpha", model_id="mlx-community/test-model", port=8080)]
+class FakeTokenizer:
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+        return "CHAT:" + "|".join(message["content"] for message in messages)
 
-        def fake_load_config(_config_path: Path) -> list[ModelConfig]:
-            nonlocal load_calls
-            load_calls += 1
-            return models
 
+class FakeRuntimeManager:
+    def __init__(self, _registry: FakeRegistry) -> None:
+        self.current = None
+
+    def needs_load(self, alias: str) -> bool:
+        return self.current != alias
+
+    @asynccontextmanager
+    async def session(self, alias: str):
+        loaded_now = self.current != alias
+        self.current = alias
+        yield mock.Mock(
+            alias=alias,
+            model_id=f"repo/{alias}",
+            model=object(),
+            tokenizer=FakeTokenizer(),
+            loaded_now=loaded_now,
+        )
+
+    def current_model(self):
+        if self.current is None:
+            return None
+        return mock.Mock(name=self.current)
+
+    async def unload(self, alias: str | None = None) -> bool:
+        if alias is None or alias == self.current:
+            self.current = None
+            return True
+        return False
+
+    async def shutdown(self) -> None:
+        self.current = None
+
+
+class ServerTests(unittest.TestCase):
+    def create_client(self):
         with (
-            mock.patch("pythia.server.load_config", side_effect=fake_load_config),
-            mock.patch("pythia.server.RuntimeManager", StubRuntimeManager),
+            mock.patch("pythia.server.ModelRegistry", FakeRegistry),
+            mock.patch("pythia.server.RuntimeManager", FakeRuntimeManager),
             mock.patch("pythia.server.snapshot_download", side_effect=RuntimeError("cache miss")),
-            mock.patch("pythia.server.list_process_statuses", return_value=[]),
         ):
             app = create_app(Path("config.yaml"))
-            client = TestClient(app)
+        return TestClient(app)
 
-            first = client.post("/api/show", json={"name": "alpha"})
-            second = client.post("/api/show", json={"name": "alpha"})
+    def test_generate_uses_in_process_generation(self) -> None:
+        with mock.patch("pythia.server.generate", return_value="hello world"):
+            client = self.create_client()
+            response = client.post(
+                "/api/generate",
+                json={"model": "alpha", "prompt": "hi", "stream": False},
+            )
 
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
-        self.assertEqual(load_calls, 1)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "hello world")
+
+    def test_chat_stream_emits_loading_line_then_tokens(self) -> None:
+        chunks = [
+            mock.Mock(text="hello", finish_reason=None),
+            mock.Mock(text=" world", finish_reason="stop"),
+        ]
+
+        with mock.patch("pythia.server.stream_generate", return_value=iter(chunks)):
+            client = self.create_client()
+            response = client.post(
+                "/api/chat",
+                json={
+                    "model": "alpha",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        lines = [json.loads(line) for line in response.text.strip().splitlines()]
+        self.assertEqual(lines[0]["status"], "loading model")
+        self.assertEqual(lines[1]["message"]["content"], "hello")
+        self.assertTrue(lines[2]["done"])
 
 
 if __name__ == "__main__":

@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from huggingface_hub import scan_cache_dir, snapshot_download
+from mlx_lm import generate, stream_generate
 from pydantic import BaseModel
 
-from pythia.config import ModelConfig, load_config
-from pythia.process import list_process_statuses, stop_model
+from pythia.registry import ModelRegistry
 from pythia.runtime import RuntimeManager
 
 
@@ -30,22 +30,21 @@ class ShowRequest(BaseModel):
 
 
 def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
-    app = FastAPI(title="Pythia API")
-    models = load_config(config_path)
-    models_by_name = {model.name: model for model in models}
-    runtime = RuntimeManager(models)
+    registry = ModelRegistry(config_path)
+    runtime = RuntimeManager(registry)
 
-    def get_model(name: str) -> ModelConfig:
-        model = models_by_name.get(name)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        await runtime.shutdown()
+
+    app = FastAPI(title="Pythia API", lifespan=lifespan)
+
+    def get_model(name: str):
+        model = registry.get(name)
         if model is None:
             raise HTTPException(status_code=404, detail=f"Unknown model '{name}'")
         return model
-
-    def get_status_map() -> dict[str, str]:
-        status_map = {status.name: status.status for status in list_process_statuses()}
-        for status in runtime.list_statuses():
-            status_map[status.name] = status.state
-        return status_map
 
     def get_cached_model_path(model_id: str) -> Path | None:
         try:
@@ -95,47 +94,60 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
     def ollama_line(payload: dict[str, Any]) -> bytes:
         return (json.dumps(payload) + "\n").encode("utf-8")
 
-    async def proxy_json(
-        model: ModelConfig,
-        path: str,
-        payload: dict[str, Any],
-    ) -> httpx.Response:
-        async with httpx.AsyncClient(timeout=None) as client:
-            response = await client.post(
-                f"http://127.0.0.1:{model.port}{path}",
-                json=payload,
-            )
-            response.raise_for_status()
-            return response
+    def chat_prompt(tokenizer: object, messages: list[dict[str, Any]]) -> str:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
-    async def iter_openai_stream(response: httpx.Response) -> Any:
-        async for line in response.aiter_lines():
-            if not line or not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
+    def generation_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
+        options = payload.get("options", {})
+        max_tokens = payload.get("max_tokens")
+        temperature = payload.get("temperature")
+        if isinstance(options, dict):
+            if max_tokens is None:
+                max_tokens = options.get("num_predict")
+            if temperature is None:
+                temperature = options.get("temperature")
+
+        kwargs: dict[str, Any] = {"verbose": False}
+        if isinstance(max_tokens, int):
+            kwargs["max_tokens"] = max_tokens
+        if isinstance(temperature, int | float):
+            kwargs["temp"] = float(temperature)
+        return kwargs
+
+    async def run_generate(model: object, tokenizer: object, prompt: str, kwargs: dict[str, Any]) -> str:
+        return await asyncio.to_thread(generate, model, tokenizer, prompt, **kwargs)
+
+    async def iter_generate(model: object, tokenizer: object, prompt: str, kwargs: dict[str, Any]):
+        iterator = stream_generate(model, tokenizer, prompt, **kwargs)
+
+        def next_chunk():
+            try:
+                return next(iterator)
+            except StopIteration:
+                return None
+
+        while True:
+            chunk = await asyncio.to_thread(next_chunk)
+            if chunk is None:
                 break
-            yield json.loads(data)
-
-    async def ensure_ready(model: ModelConfig) -> None:
-        try:
-            await runtime.ensure_ready(model.name)
-        except TimeoutError as error:
-            raise HTTPException(status_code=504, detail=str(error)) from error
-        except RuntimeError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
+            yield chunk
 
     @app.get("/api/tags")
     async def api_tags() -> dict[str, list[dict[str, Any]]]:
-        status_map = get_status_map()
+        current_model = runtime.current_model()
         model_rows: list[dict[str, Any]] = []
-        for model in models:
+        for model in registry.all():
             size, modified_at = get_model_stats(model.model_id)
+            status = "loaded" if current_model and current_model.name == model.name else "available"
             model_rows.append(
                 {
                     "name": model.name,
                     "model": model.name,
-                    "status": status_map.get(model.name, "stopped"),
+                    "status": status,
                     "size": size,
                     "modified_at": modified_at,
                 }
@@ -146,7 +158,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
     async def api_pull(request: PullRequest) -> StreamingResponse:
         model = get_model(request.model)
 
-        async def event_stream() -> Any:
+        async def event_stream():
             yield ollama_line({"status": "pulling manifest", "model": model.name})
             yield ollama_line({"status": "downloading", "model": model.name})
             try:
@@ -178,51 +190,45 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
         if not isinstance(model_name, str) or not isinstance(prompt, str):
             raise HTTPException(status_code=400, detail="Expected string 'model' and 'prompt'")
 
-        model = get_model(model_name)
-        await ensure_ready(model)
+        get_model(model_name)
         stream = bool(payload.get("stream", False))
-        backend_payload = {
-            "prompt": prompt,
-            "stream": stream,
-        }
+        kwargs = generation_kwargs(payload)
 
         if stream:
-            async def event_stream() -> Any:
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream(
-                        "POST",
-                        f"http://127.0.0.1:{model.port}/v1/completions",
-                        json=backend_payload,
-                    ) as response:
-                        response.raise_for_status()
-                        async for chunk in iter_openai_stream(response):
-                            choice = chunk["choices"][0]
-                            text = choice.get("text", "")
-                            done = choice.get("finish_reason") is not None
-                            yield ollama_line(
-                                {
-                                    "model": model.name,
-                                    "created_at": now_iso(),
-                                    "response": text,
-                                    "done": done,
-                                }
-                            )
+            needs_load = runtime.needs_load(model_name)
+
+            async def event_stream():
+                if needs_load:
+                    yield ollama_line(
+                        {
+                            "model": model_name,
+                            "created_at": now_iso(),
+                            "response": "",
+                            "done": False,
+                            "status": "loading model",
+                        }
+                    )
+                async with runtime.session(model_name) as session:
+                    async for chunk in iter_generate(session.model, session.tokenizer, prompt, kwargs):
+                        yield ollama_line(
+                            {
+                                "model": model_name,
+                                "created_at": now_iso(),
+                                "response": chunk.text,
+                                "done": chunk.finish_reason is not None,
+                            }
+                        )
 
             return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
-        try:
-            response = await proxy_json(model, "/v1/completions", backend_payload)
-        except httpx.HTTPError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-
-        data = response.json()
-        choice = data["choices"][0]
+        async with runtime.session(model_name) as session:
+            response_text = await run_generate(session.model, session.tokenizer, prompt, kwargs)
         return JSONResponse(
             {
-                "model": model.name,
+                "model": model_name,
                 "created_at": now_iso(),
-                "response": choice.get("text", ""),
-                "done": choice.get("finish_reason") is not None,
+                "response": response_text,
+                "done": True,
             }
         )
 
@@ -233,72 +239,60 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
         if not isinstance(model_name, str) or not isinstance(messages, list):
             raise HTTPException(status_code=400, detail="Expected 'model' and 'messages'")
 
-        model = get_model(model_name)
-        await ensure_ready(model)
+        get_model(model_name)
         stream = bool(payload.get("stream", False))
-        backend_payload = {
-            "messages": messages,
-            "stream": stream,
-        }
+        kwargs = generation_kwargs(payload)
 
         if stream:
-            async def event_stream() -> Any:
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream(
-                        "POST",
-                        f"http://127.0.0.1:{model.port}/v1/chat/completions",
-                        json=backend_payload,
-                    ) as response:
-                        response.raise_for_status()
-                        async for chunk in iter_openai_stream(response):
-                            choice = chunk["choices"][0]
-                            delta = choice.get("delta", {})
-                            content = delta.get("content", "")
-                            done = choice.get("finish_reason") is not None
-                            yield ollama_line(
-                                {
-                                    "model": model.name,
-                                    "created_at": now_iso(),
-                                    "message": {
-                                        "role": delta.get("role", "assistant"),
-                                        "content": content,
-                                    },
-                                    "done": done,
-                                }
-                            )
+            needs_load = runtime.needs_load(model_name)
+
+            async def event_stream():
+                if needs_load:
+                    yield ollama_line(
+                        {
+                            "model": model_name,
+                            "created_at": now_iso(),
+                            "message": {"role": "assistant", "content": ""},
+                            "done": False,
+                            "status": "loading model",
+                        }
+                    )
+                async with runtime.session(model_name) as session:
+                    prompt = chat_prompt(session.tokenizer, messages)
+                    async for chunk in iter_generate(session.model, session.tokenizer, prompt, kwargs):
+                        yield ollama_line(
+                            {
+                                "model": model_name,
+                                "created_at": now_iso(),
+                                "message": {"role": "assistant", "content": chunk.text},
+                                "done": chunk.finish_reason is not None,
+                            }
+                        )
 
             return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
-        try:
-            response = await proxy_json(model, "/v1/chat/completions", backend_payload)
-        except httpx.HTTPError as error:
-            raise HTTPException(status_code=502, detail=str(error)) from error
-
-        data = response.json()
-        choice = data["choices"][0]
-        message = choice.get("message", {})
+        async with runtime.session(model_name) as session:
+            prompt = chat_prompt(session.tokenizer, messages)
+            response_text = await run_generate(session.model, session.tokenizer, prompt, kwargs)
         return JSONResponse(
             {
-                "model": model.name,
+                "model": model_name,
                 "created_at": now_iso(),
-                "message": {
-                    "role": message.get("role", "assistant"),
-                    "content": message.get("content", ""),
-                },
-                "done": choice.get("finish_reason") is not None,
+                "message": {"role": "assistant", "content": response_text},
+                "done": True,
             }
         )
 
     @app.delete("/api/delete")
     async def api_delete(request: DeleteRequest) -> dict[str, Any]:
         model = get_model(request.model)
-        stop_result = stop_model(model.name)
+        unloaded = await runtime.unload(model.name)
         removed_path = delete_cached_model(model.model_id)
 
         return {
             "status": "success",
             "model": model.name,
-            "stopped": bool(stop_result and stop_result.was_running),
+            "stopped": unloaded,
             "removed": removed_path,
         }
 
@@ -306,11 +300,11 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
     async def api_show(request: ShowRequest) -> dict[str, Any]:
         model_config = get_model(request.name)
         size, modified_at = get_model_stats(model_config.model_id)
-        status = get_status_map().get(model_config.name, "stopped")
+        current_model = runtime.current_model()
+        status = "loaded" if current_model and current_model.name == model_config.name else "available"
         return {
             "name": model_config.name,
             "model": model_config.name,
-            "port": model_config.port,
             "status": status,
             "size": size,
             "modified_at": modified_at,
