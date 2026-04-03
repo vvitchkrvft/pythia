@@ -20,6 +20,10 @@ app = typer.Typer(help="Pythia model process manager.")
 console = Console()
 
 
+def _warn(message: str) -> None:
+    console.print(f"[yellow]Warning:[/yellow] {message}")
+
+
 def _format_ram(ram_bytes: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     value = float(ram_bytes)
@@ -45,7 +49,7 @@ def serve(
     try:
         models = load_config(config)
         for model in models:
-            record = start_model_server(model)
+            record = start_model_server(model, warn=_warn)
             console.print(
                 f"Started {record.name} on port {record.port} with PID {record.pid}"
             )
@@ -57,7 +61,7 @@ def serve(
 @app.command("ps")
 def ps_command() -> None:
     """Show model processes tracked by Pythia."""
-    statuses = list_process_statuses()
+    statuses = list_process_statuses(warn=_warn)
     if not statuses:
         console.print("No tracked processes found in ~/.pythia/pids/")
         return
@@ -89,7 +93,7 @@ def stop(
 ) -> None:
     """Stop one tracked model or all tracked models."""
     if all:
-        stop_results = stop_all_models()
+        stop_results = stop_all_models(warn=_warn)
         if not stop_results:
             console.print("No tracked models found in ~/.pythia/pids/")
             return
@@ -105,12 +109,12 @@ def stop(
         console.print("Provide a model name or use --all.")
         return
 
-    record = load_record(model_name)
+    record = load_record(model_name, warn=_warn)
     if record is None:
         console.print(f"No tracked model named '{model_name}' found.")
         return
 
-    stop_result = stop_model(model_name)
+    stop_result = stop_model(model_name, warn=_warn)
     if stop_result is None:
         console.print(f"No tracked model named '{model_name}' found.")
         return

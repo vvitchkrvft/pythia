@@ -5,8 +5,10 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 import psutil
 
@@ -19,6 +21,8 @@ class ProcessRecord:
     model_id: str
     port: int
     pid: int
+    create_time: float
+    cmdline: list[str]
 
 
 @dataclass(slots=True)
@@ -36,20 +40,42 @@ class StopResult:
     was_running: bool
 
 
+WarningCallback = Callable[[str], None]
+
+
 def ensure_state_dir() -> Path:
     state_dir = Path(os.environ.get("PYTHIA_HOME", Path.home() / ".pythia")) / "pids"
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
 
 
+def ensure_log_dir() -> Path:
+    log_dir = Path(os.environ.get("PYTHIA_HOME", Path.home() / ".pythia")) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
 def _record_path(model_name: str) -> Path:
     return ensure_state_dir() / f"{model_name}.json"
 
 
-def _read_record(path: Path) -> ProcessRecord:
-    with path.open("r", encoding="utf-8") as file:
-        payload = json.load(file)
-    return ProcessRecord(**payload)
+def _log_path(model_name: str) -> Path:
+    return ensure_log_dir() / f"{model_name}.log"
+
+
+def _warn(message: str, callback: WarningCallback | None) -> None:
+    if callback is not None:
+        callback(message)
+
+
+def _read_record(path: Path, warn: WarningCallback | None = None) -> ProcessRecord | None:
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+        return ProcessRecord(**payload)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
+        _warn(f"Skipping corrupted PID file {path.name}: {error}", warn)
+        return None
 
 
 def _write_record(record: ProcessRecord) -> None:
@@ -66,9 +92,42 @@ def _is_running(pid: int) -> bool:
         return False
 
 
-def start_model_server(model: ModelConfig) -> ProcessRecord:
-    existing_record = load_record(model.name)
-    if existing_record and _is_running(existing_record.pid):
+def _matches_record(process: psutil.Process, record: ProcessRecord) -> bool:
+    try:
+        return (
+            process.create_time() == record.create_time
+            and process.cmdline() == record.cmdline
+        )
+    except psutil.Error:
+        return False
+
+
+def _get_verified_process(
+    record: ProcessRecord, warn: WarningCallback | None = None
+) -> psutil.Process | None:
+    try:
+        process = psutil.Process(record.pid)
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            delete_record(record.name)
+            return None
+        if not _matches_record(process, record):
+            delete_record(record.name)
+            _warn(
+                f"Removed stale PID record for {record.name}: PID {record.pid} belongs to a different process.",
+                warn,
+            )
+            return None
+        return process
+    except psutil.NoSuchProcess:
+        delete_record(record.name)
+        return None
+    except psutil.Error:
+        return None
+
+
+def start_model_server(model: ModelConfig, warn: WarningCallback | None = None) -> ProcessRecord:
+    existing_record = load_record(model.name, warn=warn)
+    if existing_record and _get_verified_process(existing_record, warn=warn):
         raise RuntimeError(
             f"Model '{model.name}' is already running with PID {existing_record.pid}"
         )
@@ -82,28 +141,55 @@ def start_model_server(model: ModelConfig) -> ProcessRecord:
         "--port",
         str(model.port),
     ]
-    process = subprocess.Popen(  # noqa: S603
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    log_path = _log_path(model.name)
 
+    try:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(  # noqa: S603
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=log_file,
+                start_new_session=True,
+            )
+    except OSError as error:
+        raise RuntimeError(f"Failed to start model '{model.name}': {error}") from error
+
+    time.sleep(2)
+    return_code = process.poll()
+    if return_code is not None:
+        error_output = ""
+        try:
+            error_output = log_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        details = f" Stderr:\n{error_output}" if error_output else ""
+        raise RuntimeError(
+            f"Model '{model.name}' exited during startup with code {return_code}.{details}"
+        )
+
+    ps_process = psutil.Process(process.pid)
     record = ProcessRecord(
         name=model.name,
         model_id=model.model_id,
         port=model.port,
         pid=process.pid,
+        create_time=ps_process.create_time(),
+        cmdline=ps_process.cmdline(),
     )
     _write_record(record)
     return record
 
 
-def load_record(model_name: str) -> ProcessRecord | None:
+def load_record(
+    model_name: str, warn: WarningCallback | None = None
+) -> ProcessRecord | None:
     path = _record_path(model_name)
     if not path.exists():
         return None
-    return _read_record(path)
+    record = _read_record(path, warn=warn)
+    if record is None:
+        return None
+    return record
 
 
 def delete_record(model_name: str) -> None:
@@ -112,15 +198,19 @@ def delete_record(model_name: str) -> None:
         path.unlink()
 
 
-def stop_model(model_name: str, timeout_seconds: float = 5.0) -> StopResult | None:
-    record = load_record(model_name)
+def stop_model(
+    model_name: str,
+    timeout_seconds: float = 5.0,
+    warn: WarningCallback | None = None,
+) -> StopResult | None:
+    record = load_record(model_name, warn=warn)
     if record is None:
         return None
 
     was_running = False
     try:
-        process = psutil.Process(record.pid)
-        if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+        process = _get_verified_process(record, warn=warn)
+        if process is not None:
             was_running = True
             process.send_signal(signal.SIGTERM)
             try:
@@ -137,28 +227,41 @@ def stop_model(model_name: str, timeout_seconds: float = 5.0) -> StopResult | No
     return StopResult(record=record, was_running=was_running)
 
 
-def stop_all_models(timeout_seconds: float = 5.0) -> list[StopResult]:
+def stop_all_models(
+    timeout_seconds: float = 5.0,
+    warn: WarningCallback | None = None,
+) -> list[StopResult]:
     stopped_records: list[StopResult] = []
     for path in sorted(ensure_state_dir().glob("*.json")):
-        record = _read_record(path)
-        stopped_record = stop_model(record.name, timeout_seconds=timeout_seconds)
+        record = _read_record(path, warn=warn)
+        if record is None:
+            continue
+        stopped_record = stop_model(
+            record.name,
+            timeout_seconds=timeout_seconds,
+            warn=warn,
+        )
         if stopped_record is not None:
             stopped_records.append(stopped_record)
     return stopped_records
 
 
-def list_process_statuses() -> list[ProcessStatus]:
+def list_process_statuses(warn: WarningCallback | None = None) -> list[ProcessStatus]:
     statuses: list[ProcessStatus] = []
     for path in sorted(ensure_state_dir().glob("*.json")):
-        record = _read_record(path)
+        record = _read_record(path, warn=warn)
+        if record is None:
+            continue
         status = "stopped"
         ram_bytes = 0
 
         try:
-            process = psutil.Process(record.pid)
-            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+            process = _get_verified_process(record, warn=warn)
+            if process is not None:
                 status = "running"
                 ram_bytes = process.memory_info().rss
+            elif not _record_path(record.name).exists():
+                continue
         except psutil.Error:
             status = "stopped"
 

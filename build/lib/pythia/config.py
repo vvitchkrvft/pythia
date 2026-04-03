@@ -17,8 +17,11 @@ def load_config(config_path: Path) -> list[ModelConfig]:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with config_path.open("r", encoding="utf-8") as file:
-        raw_config = yaml.safe_load(file) or {}
+    try:
+        with config_path.open("r", encoding="utf-8") as file:
+            raw_config = yaml.safe_load(file) or {}
+    except yaml.YAMLError as error:
+        raise ValueError(f"Failed to parse config file {config_path}: {error}") from error
 
     models = raw_config.get("models")
     if not isinstance(models, list) or not models:
