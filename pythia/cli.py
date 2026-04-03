@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import uvicorn
 from rich.console import Console
 from rich.table import Table
 
@@ -15,6 +16,7 @@ from pythia.process import (
     stop_all_models,
     stop_model,
 )
+from pythia.server import create_app
 
 app = typer.Typer(help="Pythia model process manager.")
 console = Console()
@@ -43,19 +45,46 @@ def serve(
         exists=False,
         dir_okay=False,
         help="Path to config.yaml",
-    )
+    ),
+    api_port: int = typer.Option(
+        11434,
+        "--api-port",
+        help="Port for the integrated Pythia API server",
+    ),
 ) -> None:
-    """Start one mlx_lm.server process per configured model."""
+    """Start model servers and the integrated Pythia API server."""
+    started_models: list[str] = []
     try:
         models = load_config(config)
         for model in models:
             record = start_model_server(model, warn=_warn)
+            started_models.append(record.name)
             console.print(
                 f"Started {record.name} on port {record.port} with PID {record.pid}"
             )
+
+        console.print(f"Starting API server on 127.0.0.1:{api_port}")
+        server = uvicorn.Server(
+            uvicorn.Config(
+                create_app(config),
+                host="127.0.0.1",
+                port=api_port,
+                log_level="info",
+            )
+        )
+        server.run()
     except (FileNotFoundError, ValueError, RuntimeError) as error:
         console.print(f"[red]Error:[/red] {error}")
         raise typer.Exit(code=1) from error
+    except KeyboardInterrupt:
+        console.print("\nShutting down Pythia...")
+    finally:
+        for model_name in reversed(started_models):
+            stop_result = stop_model(model_name, warn=_warn)
+            if stop_result and stop_result.was_running:
+                console.print(
+                    f"Stopped {stop_result.record.name} (PID {stop_result.record.pid})"
+                )
 
 
 @app.command("ps")
@@ -123,3 +152,4 @@ def stop(
         console.print(f"Stopped {stop_result.record.name} (PID {stop_result.record.pid})")
     else:
         console.print(f"{stop_result.record.name} is already stopped.")
+
