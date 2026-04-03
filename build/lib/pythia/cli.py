@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from pythia.config import load_config
-from pythia.process import list_process_statuses, start_model_server
+from pythia.process import (
+    list_process_statuses,
+    load_record,
+    start_model_server,
+    stop_all_models,
+    stop_model,
+)
 
 app = typer.Typer(help="Pythia model process manager.")
 console = Console()
@@ -73,3 +80,42 @@ def ps_command() -> None:
         )
 
     console.print(table)
+
+
+@app.command()
+def stop(
+    model_name: Annotated[str | None, typer.Argument(help="Model name to stop")] = None,
+    all: bool = typer.Option(False, "--all", help="Stop all tracked models"),
+) -> None:
+    """Stop one tracked model or all tracked models."""
+    if all:
+        stop_results = stop_all_models()
+        if not stop_results:
+            console.print("No tracked models found in ~/.pythia/pids/")
+            return
+
+        for result in stop_results:
+            if result.was_running:
+                console.print(f"Stopped {result.record.name} (PID {result.record.pid})")
+            else:
+                console.print(f"{result.record.name} was already stopped.")
+        return
+
+    if model_name is None:
+        console.print("Provide a model name or use --all.")
+        return
+
+    record = load_record(model_name)
+    if record is None:
+        console.print(f"No tracked model named '{model_name}' found.")
+        return
+
+    stop_result = stop_model(model_name)
+    if stop_result is None:
+        console.print(f"No tracked model named '{model_name}' found.")
+        return
+
+    if stop_result.was_running:
+        console.print(f"Stopped {stop_result.record.name} (PID {stop_result.record.pid})")
+    else:
+        console.print(f"{stop_result.record.name} is already stopped.")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -27,6 +28,12 @@ class ProcessStatus:
     pid: int
     status: str
     ram_bytes: int
+
+
+@dataclass(slots=True)
+class StopResult:
+    record: ProcessRecord
+    was_running: bool
 
 
 def ensure_state_dir() -> Path:
@@ -97,6 +104,47 @@ def load_record(model_name: str) -> ProcessRecord | None:
     if not path.exists():
         return None
     return _read_record(path)
+
+
+def delete_record(model_name: str) -> None:
+    path = _record_path(model_name)
+    if path.exists():
+        path.unlink()
+
+
+def stop_model(model_name: str, timeout_seconds: float = 5.0) -> StopResult | None:
+    record = load_record(model_name)
+    if record is None:
+        return None
+
+    was_running = False
+    try:
+        process = psutil.Process(record.pid)
+        if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+            was_running = True
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.wait(timeout=timeout_seconds)
+            except psutil.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=timeout_seconds)
+    except psutil.NoSuchProcess:
+        pass
+    except psutil.Error:
+        pass
+
+    delete_record(model_name)
+    return StopResult(record=record, was_running=was_running)
+
+
+def stop_all_models(timeout_seconds: float = 5.0) -> list[StopResult]:
+    stopped_records: list[StopResult] = []
+    for path in sorted(ensure_state_dir().glob("*.json")):
+        record = _read_record(path)
+        stopped_record = stop_model(record.name, timeout_seconds=timeout_seconds)
+        if stopped_record is not None:
+            stopped_records.append(stopped_record)
+    return stopped_records
 
 
 def list_process_statuses() -> list[ProcessStatus]:
