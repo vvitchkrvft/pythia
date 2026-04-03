@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from huggingface_hub import snapshot_download
+from huggingface_hub import scan_cache_dir, snapshot_download
 from pydantic import BaseModel
 
 from pythia.config import ModelConfig, load_config
@@ -23,6 +22,10 @@ class PullRequest(BaseModel):
 
 class DeleteRequest(BaseModel):
     model: str
+
+
+class ShowRequest(BaseModel):
+    name: str
 
 
 def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
@@ -45,6 +48,24 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             return Path(snapshot_download(repo_id=model_id, local_files_only=True))
         except Exception:
             return None
+
+    def delete_cached_model(model_id: str) -> bool:
+        try:
+            cache_info = scan_cache_dir()
+        except Exception:
+            return False
+
+        repo = next((repo for repo in cache_info.repos if repo.repo_id == model_id), None)
+        if repo is None:
+            return False
+
+        revision_hashes = [revision.commit_hash for revision in repo.revisions]
+        if not revision_hashes:
+            return False
+
+        delete_strategy = cache_info.delete_revisions(*revision_hashes)
+        delete_strategy.execute()
+        return True
 
     def get_model_stats(model_id: str) -> tuple[int, str | None]:
         model_path = get_cached_model_path(model_id)
@@ -108,7 +129,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             models.append(
                 {
                     "name": model.name,
-                    "model": model.model_id,
+                    "model": model.name,
                     "status": status_map.get(model.name, "stopped"),
                     "size": size,
                     "modified_at": modified_at,
@@ -267,12 +288,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
     async def api_delete(request: DeleteRequest) -> dict[str, Any]:
         model = get_model(request.model)
         stop_result = stop_model(model.name)
-
-        cached_path = get_cached_model_path(model.model_id)
-        removed_path = False
-        if cached_path is not None and cached_path.exists():
-            shutil.rmtree(cached_path, ignore_errors=True)
-            removed_path = True
+        removed_path = delete_cached_model(model.model_id)
 
         return {
             "status": "success",
@@ -281,18 +297,19 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             "removed": removed_path,
         }
 
-    @app.get("/api/show")
-    async def api_show(model: str = Query(...)) -> dict[str, Any]:
-        model_config = get_model(model)
+    @app.post("/api/show")
+    async def api_show(request: ShowRequest) -> dict[str, Any]:
+        model_config = get_model(request.name)
         size, modified_at = get_model_stats(model_config.model_id)
         status = get_status_map().get(model_config.name, "stopped")
         return {
             "name": model_config.name,
-            "model": model_config.model_id,
+            "model": model_config.name,
             "port": model_config.port,
             "status": status,
             "size": size,
             "modified_at": modified_at,
+            "details": {"model_id": model_config.model_id},
         }
 
     return app
