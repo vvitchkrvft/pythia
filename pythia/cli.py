@@ -12,6 +12,7 @@ from rich.table import Table
 from pythia.config import load_config
 from pythia.process import (
     delete_api_pid,
+    get_api_server_status,
     list_process_statuses,
     load_record,
     stop_api_server,
@@ -58,7 +59,7 @@ def serve(
     """Start the integrated Pythia API server."""
     try:
         load_config(config)
-        write_api_pid(os.getpid())
+        write_api_pid(os.getpid(), host="127.0.0.1", port=api_port)
         console.print(f"Starting API server on 127.0.0.1:{api_port}")
         server = uvicorn.Server(
             uvicorn.Config(
@@ -84,13 +85,28 @@ def serve(
 
 @app.command("ps")
 def ps_command() -> None:
-    """Show model processes tracked by Pythia."""
+    """Show API server and model process status."""
+    api_status = get_api_server_status(warn=_warn)
+    api_table = Table(title="API Server")
+    api_table.add_column("Status")
+    api_table.add_column("PID", justify="right")
+    api_table.add_column("Host")
+    api_table.add_column("Port", justify="right")
+    api_style = "green" if api_status.status == "running" else "red"
+    api_table.add_row(
+        f"[{api_style}]{api_status.status}[/{api_style}]",
+        str(api_status.pid) if api_status.pid is not None else "-",
+        api_status.host,
+        str(api_status.port),
+    )
+    console.print(api_table)
+
     statuses = list_process_statuses(warn=_warn)
     if not statuses:
-        console.print("No tracked processes found in ~/.pythia/pids/")
+        console.print("No tracked model processes found in ~/.pythia/pids/")
         return
 
-    table = Table(title="Pythia Processes")
+    table = Table(title="Model Processes")
     table.add_column("Model Name")
     table.add_column("Port", justify="right")
     table.add_column("PID", justify="right")

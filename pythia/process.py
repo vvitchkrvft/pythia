@@ -39,6 +39,14 @@ class StopResult:
     was_running: bool
 
 
+@dataclass(slots=True)
+class ApiServerStatus:
+    host: str
+    port: int
+    pid: int | None
+    status: str
+
+
 WarningCallback = Callable[[str], None]
 
 
@@ -218,22 +226,50 @@ def delete_record(model_name: str) -> None:
         path.unlink()
 
 
-def write_api_pid(pid: int) -> None:
+def write_api_pid(pid: int, host: str = "127.0.0.1", port: int = 11434) -> None:
     path = api_pid_path()
-    path.write_text(f"{pid}\n", encoding="utf-8")
+    payload = {"pid": pid, "host": host, "port": port}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def read_api_pid_status(warn: WarningCallback | None = None) -> ApiServerStatus:
+    path = api_pid_path()
+    default_status = ApiServerStatus(
+        host="127.0.0.1",
+        port=11434,
+        pid=None,
+        status="stopped",
+    )
+    if not path.exists():
+        return default_status
+
+    try:
+        raw_value = path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        _warn(f"Removed corrupted API PID file: {error}", warn)
+        delete_api_pid()
+        return default_status
+
+    try:
+        if raw_value.startswith("{"):
+            payload = json.loads(raw_value)
+            pid = int(payload["pid"])
+            host = str(payload.get("host", "127.0.0.1"))
+            port = int(payload.get("port", 11434))
+        else:
+            pid = int(raw_value)
+            host = "127.0.0.1"
+            port = 11434
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        _warn(f"Removed corrupted API PID file: {error}", warn)
+        delete_api_pid()
+        return default_status
+
+    return ApiServerStatus(host=host, port=port, pid=pid, status="running")
 
 
 def read_api_pid(warn: WarningCallback | None = None) -> int | None:
-    path = api_pid_path()
-    if not path.exists():
-        return None
-
-    try:
-        return int(path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError) as error:
-        _warn(f"Removed corrupted API PID file: {error}", warn)
-        delete_api_pid()
-        return None
+    return read_api_pid_status(warn=warn).pid
 
 
 def delete_api_pid() -> None:
@@ -256,18 +292,18 @@ def _looks_like_pythia_api_server(process: psutil.Process) -> bool:
 
 
 def get_api_server_process(warn: WarningCallback | None = None) -> psutil.Process | None:
-    pid = read_api_pid(warn=warn)
-    if pid is None:
+    api_status = read_api_pid_status(warn=warn)
+    if api_status.pid is None:
         return None
 
     try:
-        process = psutil.Process(pid)
+        process = psutil.Process(api_status.pid)
         if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
             delete_api_pid()
             return None
         if not _looks_like_pythia_api_server(process):
             _warn(
-                f"Removed stale API PID file: PID {pid} is not a Pythia API server.",
+                f"Removed stale API PID file: PID {api_status.pid} is not a Pythia API server.",
                 warn,
             )
             delete_api_pid()
@@ -278,6 +314,28 @@ def get_api_server_process(warn: WarningCallback | None = None) -> psutil.Proces
         return None
     except psutil.Error:
         return None
+
+
+def get_api_server_status(warn: WarningCallback | None = None) -> ApiServerStatus:
+    api_status = read_api_pid_status(warn=warn)
+    if api_status.pid is None:
+        return api_status
+
+    process = get_api_server_process(warn=warn)
+    if process is None:
+        return ApiServerStatus(
+            host=api_status.host,
+            port=api_status.port,
+            pid=None,
+            status="stopped",
+        )
+
+    return ApiServerStatus(
+        host=api_status.host,
+        port=api_status.port,
+        pid=process.pid,
+        status="running",
+    )
 
 
 def stop_api_server(
