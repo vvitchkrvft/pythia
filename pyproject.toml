@@ -12,3 +12,6 @@ dependencies = [
     "rich>=14.3.3",
     "typer>=0.24.1",
 ]
+
+[project.scripts]
+pythia = "pythia.cli:app"

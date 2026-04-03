@@ -1,0 +1,7 @@
+models:
+  - name: qwen3-coder
+    model_id: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+    port: 8080
+  - name: glm-flash
+    model_id: mlx-community/GLM-4.7-Flash-4bit
+    port: 8081

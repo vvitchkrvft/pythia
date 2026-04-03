@@ -1,0 +1,2 @@
+[console_scripts]
+pythia = pythia.cli:app

@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: pythia
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: huggingface-hub>=1.8.0
+Requires-Dist: mlx-lm>=0.31.1
+Requires-Dist: psutil>=7.2.2
+Requires-Dist: pyyaml>=6.0.3
+Requires-Dist: rich>=14.3.3
+Requires-Dist: typer>=0.24.1
