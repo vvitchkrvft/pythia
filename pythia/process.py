@@ -5,7 +5,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -43,16 +42,26 @@ class StopResult:
 WarningCallback = Callable[[str], None]
 
 
+def _pythia_home() -> Path:
+    return Path(os.environ.get("PYTHIA_HOME", Path.home() / ".pythia"))
+
+
 def ensure_state_dir() -> Path:
-    state_dir = Path(os.environ.get("PYTHIA_HOME", Path.home() / ".pythia")) / "pids"
+    state_dir = _pythia_home() / "pids"
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
 
 
 def ensure_log_dir() -> Path:
-    log_dir = Path(os.environ.get("PYTHIA_HOME", Path.home() / ".pythia")) / "logs"
+    log_dir = _pythia_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+
+def api_pid_path() -> Path:
+    state_dir = _pythia_home()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "api.pid"
 
 
 def _record_path(model_name: str) -> Path:
@@ -154,7 +163,6 @@ def start_model_server(model: ModelConfig, warn: WarningCallback | None = None) 
     except OSError as error:
         raise RuntimeError(f"Failed to start model '{model.name}': {error}") from error
 
-    time.sleep(2)
     return_code = process.poll()
     if return_code is not None:
         error_output = ""
@@ -192,10 +200,108 @@ def load_record(
     return record
 
 
+def get_live_record(
+    model_name: str, warn: WarningCallback | None = None
+) -> ProcessRecord | None:
+    record = load_record(model_name, warn=warn)
+    if record is None:
+        return None
+    process = _get_verified_process(record, warn=warn)
+    if process is None:
+        return None
+    return record
+
+
 def delete_record(model_name: str) -> None:
     path = _record_path(model_name)
     if path.exists():
         path.unlink()
+
+
+def write_api_pid(pid: int) -> None:
+    path = api_pid_path()
+    path.write_text(f"{pid}\n", encoding="utf-8")
+
+
+def read_api_pid(warn: WarningCallback | None = None) -> int | None:
+    path = api_pid_path()
+    if not path.exists():
+        return None
+
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as error:
+        _warn(f"Removed corrupted API PID file: {error}", warn)
+        delete_api_pid()
+        return None
+
+
+def delete_api_pid() -> None:
+    path = api_pid_path()
+    if path.exists():
+        path.unlink()
+
+
+def _looks_like_pythia_api_server(process: psutil.Process) -> bool:
+    try:
+        cmdline = process.cmdline()
+    except psutil.Error:
+        return False
+
+    joined = " ".join(cmdline)
+    return (
+        ("pythia" in joined and "serve" in joined)
+        or ("pythia.cli" in joined and "serve" in joined)
+    )
+
+
+def get_api_server_process(warn: WarningCallback | None = None) -> psutil.Process | None:
+    pid = read_api_pid(warn=warn)
+    if pid is None:
+        return None
+
+    try:
+        process = psutil.Process(pid)
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            delete_api_pid()
+            return None
+        if not _looks_like_pythia_api_server(process):
+            _warn(
+                f"Removed stale API PID file: PID {pid} is not a Pythia API server.",
+                warn,
+            )
+            delete_api_pid()
+            return None
+        return process
+    except psutil.NoSuchProcess:
+        delete_api_pid()
+        return None
+    except psutil.Error:
+        return None
+
+
+def stop_api_server(
+    timeout_seconds: float = 5.0,
+    warn: WarningCallback | None = None,
+) -> bool:
+    process = get_api_server_process(warn=warn)
+    if process is None:
+        return False
+
+    try:
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=timeout_seconds)
+        except psutil.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=timeout_seconds)
+    except psutil.NoSuchProcess:
+        pass
+    except psutil.Error:
+        pass
+
+    delete_api_pid()
+    return True
 
 
 def stop_model(

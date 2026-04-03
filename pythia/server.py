@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from pythia.config import ModelConfig, load_config
 from pythia.process import list_process_statuses, stop_model
+from pythia.runtime import RuntimeManager
 
 
 class PullRequest(BaseModel):
@@ -30,18 +31,21 @@ class ShowRequest(BaseModel):
 
 def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
     app = FastAPI(title="Pythia API")
-
-    def load_models() -> list[ModelConfig]:
-        return load_config(config_path)
+    models = load_config(config_path)
+    models_by_name = {model.name: model for model in models}
+    runtime = RuntimeManager(models)
 
     def get_model(name: str) -> ModelConfig:
-        for model in load_models():
-            if model.name == name:
-                return model
-        raise HTTPException(status_code=404, detail=f"Unknown model '{name}'")
+        model = models_by_name.get(name)
+        if model is None:
+            raise HTTPException(status_code=404, detail=f"Unknown model '{name}'")
+        return model
 
     def get_status_map() -> dict[str, str]:
-        return {status.name: status.status for status in list_process_statuses()}
+        status_map = {status.name: status.status for status in list_process_statuses()}
+        for status in runtime.list_statuses():
+            status_map[status.name] = status.state
+        return status_map
 
     def get_cached_model_path(model_id: str) -> Path | None:
         try:
@@ -113,20 +117,21 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
                 break
             yield json.loads(data)
 
-    def ensure_running(model: ModelConfig) -> None:
-        if get_status_map().get(model.name) != "running":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Model '{model.name}' is not running. Start it with `pythia serve`.",
-            )
+    async def ensure_ready(model: ModelConfig) -> None:
+        try:
+            await runtime.ensure_ready(model.name)
+        except TimeoutError as error:
+            raise HTTPException(status_code=504, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
 
     @app.get("/api/tags")
     async def api_tags() -> dict[str, list[dict[str, Any]]]:
         status_map = get_status_map()
-        models: list[dict[str, Any]] = []
-        for model in load_models():
+        model_rows: list[dict[str, Any]] = []
+        for model in models:
             size, modified_at = get_model_stats(model.model_id)
-            models.append(
+            model_rows.append(
                 {
                     "name": model.name,
                     "model": model.name,
@@ -135,7 +140,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
                     "modified_at": modified_at,
                 }
             )
-        return {"models": models}
+        return {"models": model_rows}
 
     @app.post("/api/pull")
     async def api_pull(request: PullRequest) -> StreamingResponse:
@@ -174,7 +179,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             raise HTTPException(status_code=400, detail="Expected string 'model' and 'prompt'")
 
         model = get_model(model_name)
-        ensure_running(model)
+        await ensure_ready(model)
         stream = bool(payload.get("stream", False))
         backend_payload = {
             "prompt": prompt,
@@ -229,7 +234,7 @@ def create_app(config_path: Path = Path("config.yaml")) -> FastAPI:
             raise HTTPException(status_code=400, detail="Expected 'model' and 'messages'")
 
         model = get_model(model_name)
-        ensure_running(model)
+        await ensure_ready(model)
         stream = bool(payload.get("stream", False))
         backend_payload = {
             "messages": messages,

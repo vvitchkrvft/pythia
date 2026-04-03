@@ -92,7 +92,7 @@ Fields:
 
 ### `pythia serve`
 
-Starts all configured model servers and the integrated API server. The command blocks until interrupted.
+Starts the integrated API server. Model servers are started lazily on first request. The command blocks until interrupted.
 
 Options:
 
@@ -113,7 +113,7 @@ Reads `~/.pythia/pids/`, verifies tracked processes, and prints a Rich table wit
 
 ### `pythia stop`
 
-Stops tracked model processes and removes their PID files.
+Stops the Pythia API server by default. Use a model name to stop one tracked model, or `--all` to stop both the API server and all tracked models.
 
 Examples:
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -10,15 +11,17 @@ from rich.table import Table
 
 from pythia.config import load_config
 from pythia.process import (
+    delete_api_pid,
     list_process_statuses,
     load_record,
-    start_model_server,
+    stop_api_server,
     stop_all_models,
     stop_model,
+    write_api_pid,
 )
 from pythia.server import create_app
 
-app = typer.Typer(help="Pythia model process manager.")
+app = typer.Typer(help="Pythia API server and model process manager.")
 console = Console()
 
 
@@ -52,17 +55,10 @@ def serve(
         help="Port for the integrated Pythia API server",
     ),
 ) -> None:
-    """Start model servers and the integrated Pythia API server."""
-    started_models: list[str] = []
+    """Start the integrated Pythia API server."""
     try:
-        models = load_config(config)
-        for model in models:
-            record = start_model_server(model, warn=_warn)
-            started_models.append(record.name)
-            console.print(
-                f"Started {record.name} on port {record.port} with PID {record.pid}"
-            )
-
+        load_config(config)
+        write_api_pid(os.getpid())
         console.print(f"Starting API server on 127.0.0.1:{api_port}")
         server = uvicorn.Server(
             uvicorn.Config(
@@ -79,12 +75,11 @@ def serve(
     except KeyboardInterrupt:
         console.print("\nShutting down Pythia...")
     finally:
-        for model_name in reversed(started_models):
-            stop_result = stop_model(model_name, warn=_warn)
-            if stop_result and stop_result.was_running:
-                console.print(
-                    f"Stopped {stop_result.record.name} (PID {stop_result.record.pid})"
-                )
+        delete_api_pid()
+        stop_results = stop_all_models(warn=_warn)
+        for result in stop_results:
+            if result.was_running:
+                console.print(f"Stopped {result.record.name} (PID {result.record.pid})")
 
 
 @app.command("ps")
@@ -117,25 +112,32 @@ def ps_command() -> None:
 
 @app.command()
 def stop(
-    model_name: Annotated[str | None, typer.Argument(help="Model name to stop")] = None,
-    all: bool = typer.Option(False, "--all", help="Stop all tracked models"),
+    model_name: Annotated[
+        str | None, typer.Argument(help="Model name to stop. Omit to stop the API server.")
+    ] = None,
+    all: bool = typer.Option(False, "--all", help="Stop the API server and all tracked models"),
 ) -> None:
-    """Stop one tracked model or all tracked models."""
+    """Stop the API server, or stop one model by name."""
     if all:
+        api_stopped = stop_api_server(warn=_warn)
         stop_results = stop_all_models(warn=_warn)
-        if not stop_results:
-            console.print("No tracked models found in ~/.pythia/pids/")
-            return
+        if api_stopped:
+            console.print("Stopped Pythia API server.")
 
         for result in stop_results:
             if result.was_running:
                 console.print(f"Stopped {result.record.name} (PID {result.record.pid})")
             else:
                 console.print(f"{result.record.name} was already stopped.")
+        if not api_stopped and not stop_results:
+            console.print("No running Pythia API server or tracked models found.")
         return
 
     if model_name is None:
-        console.print("Provide a model name or use --all.")
+        if stop_api_server(warn=_warn):
+            console.print("Stopped Pythia API server.")
+        else:
+            console.print("No running Pythia API server found.")
         return
 
     record = load_record(model_name, warn=_warn)
@@ -152,4 +154,3 @@ def stop(
         console.print(f"Stopped {stop_result.record.name} (PID {stop_result.record.pid})")
     else:
         console.print(f"{stop_result.record.name} is already stopped.")
-

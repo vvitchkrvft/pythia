@@ -1,1 +1,0 @@
-"""Pythia package."""
